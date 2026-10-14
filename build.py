@@ -86,6 +86,14 @@ footer{padding:24px 16px;color:var(--muted);font-size:13px}
 def esc(s):
     return html.escape(str(s))
 
+def network_html(cfg):
+    """页脚"更多实用工具":同系列网站互相链接(列表见 config.json 的 network)。"""
+    sites = [s for s in cfg.get("network", []) if s["url"].rstrip("/") != cfg["base_url"].rstrip("/")]
+    if not sites:
+        return ""
+    return "<br>更多实用工具:" + " · ".join(f'<a href="{esc(s["url"])}">{esc(s["name"])}</a>' for s in sites)
+
+
 
 def ymd(d):
     return d.isoformat()
@@ -172,7 +180,7 @@ class Site:
 <header><a class="logo" href="/">{esc(cfg["site_name"])}</a><nav><a href="/">今天</a><a href="/m/{self.today:%Y-%m}/">本月日历</a>
 <a href="/jieri/">节日倒计时</a><a href="/jieqi/">二十四节气</a><a href="/shengxiao/">生肖年龄</a><a href="/tools/">日期计算</a></nav></header>
 <main>{body}</main>
-<footer>农历、节气、干支由天文历法算法计算;黄历宜忌、冲煞等为传统民俗内容,仅供文化参考。法定节假日放假安排以国务院办公厅发布的通知为准。</footer>
+<footer>农历、节气、干支由天文历法算法计算;黄历宜忌、冲煞等为传统民俗内容,仅供文化参考。法定节假日放假安排以国务院办公厅发布的通知为准。{network_html(cfg)}</footer>
 </body></html>""".replace('href="/', f'href="{prefix}/')
         f = OUT / path.strip("/") / "index.html"
         f.parent.mkdir(parents=True, exist_ok=True)
