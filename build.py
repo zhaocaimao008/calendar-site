@@ -20,6 +20,8 @@ from zoneinfo import ZoneInfo
 
 from lunar_python import Lunar, Solar
 
+from seo_content import FESTIVAL_COPY, JIEQI_COPY
+
 ROOT = Path(__file__).parent
 OUT = ROOT / "dist"
 WEEK = "一二三四五六日"
@@ -85,6 +87,22 @@ footer{padding:24px 16px;color:var(--muted);font-size:13px}
 
 def esc(s):
     return html.escape(str(s))
+
+
+def clip_list(items, max_chars):
+    """宜忌写入摘要时按整项截断,不把一个词切成两半。"""
+    out, n = [], 0
+    for it in items:
+        extra = len(it) + (1 if out else 0)
+        if out and n + extra > max_chars:
+            return "、".join(out) + "等"
+        out.append(it)
+        n += extra
+    return "、".join(out) or "无"
+
+
+def jieqi_slug(name):
+    return JIEQI_SLUG[JIEQI.index(name)]
 
 def network_html(cfg):
     """页脚"更多实用工具":同系列网站互相链接(列表见 config.json 的 network)。"""
@@ -163,7 +181,109 @@ class Site:
         return (f'<div class="ad"><ins class="adsbygoogle" style="display:block" data-ad-client="{esc(c)}" data-ad-format="auto" '
                 'data-full-width-responsive="true"></ins><script>(adsbygoogle=window.adsbygoogle||[]).push({});</script></div>')
 
-    def write(self, path, title, desc, body):
+    def abs_url(self, path):
+        return self.cfg["base_url"].rstrip("/") + path
+
+    def adjacent_jieqi(self, d):
+        """当天之前、之后的节气。按公历日期比较,避免交节时刻把“今天”算成下一个节气。"""
+        prev = nxt = None
+        p = d - dt.timedelta(days=1)
+        while p in self.days:
+            name = self.days[p].getJieQi()
+            if name:
+                prev = (p, name)
+                break
+            p -= dt.timedelta(days=1)
+        n = d + dt.timedelta(days=1)
+        while n in self.days:
+            name = self.days[n].getJieQi()
+            if name:
+                nxt = (n, name)
+                break
+            n += dt.timedelta(days=1)
+        return prev, nxt
+
+    def jieqi_link(self, day, name):
+        if name not in JIEQI:
+            return f"{esc(name)}({cn(day)})"
+        return f'<a href="/jieqi/{jieqi_slug(name)}/">{esc(name)}</a>({cn(day)})'
+
+    def breadcrumb_ld(self, crumbs):
+        return {
+            "@type": "BreadcrumbList",
+            "itemListElement": [
+                {"@type": "ListItem", "position": i, "name": name, "item": self.abs_url(path)}
+                for i, (name, path) in enumerate(crumbs, 1)
+            ],
+        }
+
+    def faq_ld(self, pairs):
+        return {
+            "@type": "FAQPage",
+            "mainEntity": [
+                {"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}}
+                for q, a in pairs
+            ],
+        }
+
+    def home_ld(self, desc):
+        url, name = self.abs_url("/"), self.cfg["site_name"]
+        return [
+            {"@type": "WebSite", "name": name, "url": url, "inLanguage": "zh-CN", "description": desc},
+            {
+                "@type": "WebApplication",
+                "name": name,
+                "url": url,
+                "applicationCategory": "LifestyleApplication",
+                "operatingSystem": "All",
+                "inLanguage": "zh-CN",
+                "description": desc,
+                "offers": {"@type": "Offer", "price": "0", "priceCurrency": "CNY"},
+            },
+        ]
+
+    def event_ld(self, name, day, description, path):
+        # 全国性节日没有单一场馆。地点写中国,日期只用公历日(全天),不编造街道或票价。
+        return {
+            "@type": "Event",
+            "name": name,
+            "startDate": ymd(day),
+            "endDate": ymd(day),
+            "eventStatus": "https://schema.org/EventScheduled",
+            "eventAttendanceMode": "https://schema.org/OfflineEventAttendanceMode",
+            "description": description,
+            "url": self.abs_url(path),
+            "location": {
+                "@type": "Place",
+                "name": "中国",
+                "address": {"@type": "PostalAddress", "addressCountry": "CN", "addressLocality": "中国"},
+            },
+        }
+
+    def ld_script(self, nodes):
+        if not nodes:
+            return ""
+        raw = json.dumps({"@context": "https://schema.org", "@graph": nodes}, ensure_ascii=False, separators=(",", ":"))
+        return f'<script type="application/ld+json">{raw.replace("<", "\\u003c")}</script>'
+
+    def og_tags(self, title, desc, url):
+        return (
+            f'<meta property="og:title" content="{esc(title)}">'
+            f'<meta property="og:description" content="{esc(desc)}">'
+            f'<meta property="og:url" content="{esc(url)}">'
+            f'<meta property="og:type" content="website">'
+            f'<meta property="og:site_name" content="{esc(self.cfg["site_name"])}">'
+            f'<meta property="og:locale" content="zh_CN">'
+        )
+
+    def copy_card(self, name, origin, customs):
+        q1, q2 = f"{name}是怎么来的?", f"{name}有哪些习俗?"
+        card = f"""<div class="card"><h2>由来与习俗</h2>
+<p><b>{esc(q1)}</b></p><p>{esc(origin)}</p>
+<p><b>{esc(q2)}</b></p><p>{esc(customs)}</p></div>"""
+        return card, [(q1, origin), (q2, customs)]
+
+    def write(self, path, title, desc, body, crumbs=None, jsonld=None):
         cfg = self.cfg
         ads = ""
         if cfg.get("adsense_client"):
@@ -172,11 +292,17 @@ class Site:
         # 超出每日页面生成范围的日期只显示文字,不加链接
         body = re.sub(r'<a href="/d/(\d{4})-\d\d-\d\d/">(.*?)</a>',
                       lambda m: m.group(0) if self.y0 <= int(m.group(1)) <= self.y1 else m.group(2), body)
+        nodes = []
+        if crumbs:
+            nodes.append(self.breadcrumb_ld(crumbs))
+        if jsonld:
+            nodes.extend(jsonld)
+        url = self.abs_url(path)
         prefix = urllib.parse.urlparse(cfg["base_url"]).path.rstrip("/")
         page = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{esc(title)}</title><meta name="description" content="{esc(desc)}">
-<link rel="canonical" href="{esc(cfg["base_url"].rstrip("/") + path)}">{ads}<style>{CSS}</style></head><body>
+<link rel="canonical" href="{esc(url)}">{self.og_tags(title, desc, url)}{ads}{self.ld_script(nodes)}<style>{CSS}</style></head><body>
 <header><a class="logo" href="/">{esc(cfg["site_name"])}</a><nav><a href="/">今天</a><a href="/m/{self.today:%Y-%m}/">本月日历</a>
 <a href="/jieri/">节日倒计时</a><a href="/jieqi/">二十四节气</a><a href="/shengxiao/">生肖年龄</a><a href="/tools/">日期计算</a></nav></header>
 <main>{body}</main>
@@ -221,8 +347,12 @@ class Site:
         l, s = self.days[d], solar(d)
         fest = self.festivals_of(d)
         jq = l.getJieQi()
-        prev_jq, next_jq = l.getPrevJieQi(), l.getNextJieQi()
-        yi, ji = "、".join(l.getDayYi()), "、".join(l.getDayJi())
+        prev_jq, next_jq = self.adjacent_jieqi(d)
+        yi_list, ji_list = l.getDayYi(), l.getDayJi()
+        yi, ji = "、".join(yi_list) or "无", "、".join(ji_list) or "无"
+        chong_sx = l.getDayChongShengXiao() or "无"
+        chong_gz = f"{l.getDayChongGan()}{l.getDayChong()}"
+        sha = l.getDaySha() or "无"
         doy = d.timetuple().tm_yday
         days_in_year = 366 if (d.year % 4 == 0 and d.year % 100 != 0) or d.year % 400 == 0 else 365
         special = "、".join(([jq] if jq else []) + fest)
@@ -240,16 +370,19 @@ class Site:
 <div>当年第几天<b>第 {doy} 天</b></div><div>本年剩余<b>{days_in_year - doy} 天</b></div>
 <div>第几周<b>第 {d.isocalendar()[1]} 周</b></div><div>纳音<b>{l.getDayNaYin()}</b></div></div></div>
 {self.ad()}
-<div class="card"><h2>节气</h2><p>{f"今天是<b>{jq}</b>。" if jq else ""}上一个节气:{prev_jq.getName()}({cn(to_date(prev_jq.getSolar()))}),
-下一个节气:<a href="/jieqi/{JIEQI_SLUG[JIEQI.index(next_jq.getName())]}/">{next_jq.getName()}</a>({cn(to_date(next_jq.getSolar()))})。</p></div>
-<div class="card"><h2>黄历宜忌</h2><p><b>宜:</b>{esc(yi) or "—"}</p><p><b>忌:</b>{esc(ji) or "—"}</p>
-<p class="muted">冲煞:冲{esc(l.getDayChongDesc())},煞{esc(l.getDaySha())} · 彭祖百忌:{esc(l.getPengZuGan())},{esc(l.getPengZuZhi())}<br>以上为传统民俗内容,仅供文化参考。</p></div>
+<div class="card"><h2>节气</h2><p>{f'今天是<b><a href="/jieqi/{jieqi_slug(jq)}/">{esc(jq)}</a></b>。' if jq else ""}上一个节气:{self.jieqi_link(*prev_jq) if prev_jq else "无"},
+下一个节气:{self.jieqi_link(*next_jq) if next_jq else "无"}。</p></div>
+<div class="card"><h2>黄历宜忌</h2><p><b>宜:</b>{esc(yi)}</p><p><b>忌:</b>{esc(ji)}</p>
+<p class="muted">冲煞:冲{esc(chong_sx)}({esc(chong_gz)}),煞{esc(sha)} · 彭祖百忌:{esc(l.getPengZuGan())},{esc(l.getPengZuZhi())}<br>以上为传统民俗内容,仅供文化参考。</p></div>
 <div class="card"><h2>本月日历</h2>{self.month_grid(d.year, d.month)}</div>
 <div class="card"><div class="links">{nav}</div></div>"""
+        prev_name = prev_jq[1] if prev_jq else "无"
+        next_name = next_jq[1] if next_jq else "无"
         self.write(f"/d/{ymd(d)}/",
                    f"{cn(d)}农历是多少 - {lunar_str} 星期{WEEK[d.weekday()]}{(' ' + special) if special else ''} 黄历宜忌",
-                   f"{cn(d)},{lunar_str},星期{WEEK[d.weekday()]},{l.getYearInGanZhi()}年{l.getYearShengXiao()}年。{('今天是' + special + '。') if special else ''}宜{yi[:30]};忌{ji[:30]}。",
-                   body)
+                   f"{cn(d)},{lunar_str},星期{WEEK[d.weekday()]}。宜{clip_list(yi_list, 28)}。忌{clip_list(ji_list, 18)}。冲{chong_sx},煞{sha}。今日节气{jq or '无'},上一个节气{prev_name},下一个节气{next_name}。",
+                   body,
+                   crumbs=[("首页", "/"), (f"{d.year}年", f"/y/{d.year}/"), (f"{d.year}年{d.month}月", f"/m/{d:%Y-%m}/"), (cn(d), f"/d/{ymd(d)}/")])
 
     def month_page(self, y, m):
         fests = []
@@ -271,7 +404,8 @@ class Site:
 <div class="links" style="margin-top:12px">{"".join(nav)}</div></div>{self.ad()}
 <div class="card"><h2>{y}年{m}月节日和节气</h2><table>{"".join(fests)}</table></div>"""
         self.write(f"/m/{y}-{m:02d}/", f"{y}年{m}月日历 - {y}年{m}月农历节日节气表",
-                   f"{y}年{m}月日历,带农历、二十四节气和节日,点击日期查看当天黄历宜忌。", body)
+                   f"{y}年{m}月日历,带农历、二十四节气和节日,点击日期查看当天黄历宜忌。", body,
+                   crumbs=[("首页", "/"), (f"{y}年", f"/y/{y}/"), (f"{y}年{m}月", f"/m/{y}-{m:02d}/")])
 
     def year_page(self, y):
         months = "".join(f'<a href="/m/{y}-{m:02d}/">{m}月</a>' for m in range(1, 13))
@@ -290,7 +424,8 @@ class Site:
 <div class="card"><h2>{y}年节日一览</h2><table>{"".join(r for _, r in sorted(fr))}</table></div>
 <div class="card"><h2>{y}年二十四节气时间表</h2><table>{jq_rows}</table></div>"""
         self.write(f"/y/{y}/", f"{y}年日历 - {y}年是什么年、春节几月几号、节日节气时间表",
-                   f"{y}年是农历{self.days[spring].getYearInGanZhi()}年({animal}年),春节是{cn(spring)}。{y}年全年日历、节日和二十四节气时间表。", body)
+                   f"{y}年是农历{self.days[spring].getYearInGanZhi()}年({animal}年),春节是{cn(spring)}。{y}年全年日历、节日和二十四节气时间表。", body,
+                   crumbs=[("首页", "/"), (f"{y}年", f"/y/{y}/")])
 
     def festival_pages(self):
         rows = []
@@ -298,20 +433,33 @@ class Site:
             dates = self.occurrences(rule)
             nd = self.next_on_or_after(dates)
             l = self.days[nd]
+            origin, customs = FESTIVAL_COPY[slug]
+            countdown = self.countdown(nd)
             table = "".join(f'<tr><td>{d.year}年</td><td><a href="/d/{ymd(d)}/">{d.month}月{d.day}日</a></td><td>星期{WEEK[d.weekday()]}</td>'
                             f'<td>农历{self.days[d].getMonthInChinese()}月{self.days[d].getDayInChinese()}</td></tr>'
                             for d in dates if self.today.year - 1 <= d.year <= self.today.year + 5)
+            copy_html, copy_faq = self.copy_card(name, origin, customs)
+            if slug == "qingming":
+                copy_html = copy_html.replace("</div>", '<p class="muted">节气日期见<a href="/jieqi/qingming/">清明</a>。</p></div>', 1)
             body = f"""<div class="card"><h1>距离{name}还有多少天</h1>
-<div class="big">{self.countdown(nd)}</div>
+<div class="big">{countdown}</div>
 <p>下一个{name}是 <a href="/d/{ymd(nd)}/">{cn(nd)}</a>,星期{WEEK[nd.weekday()]},农历{l.getMonthInChinese()}月{l.getDayInChinese()}。</p>
 <p class="muted">{esc(desc)}</p></div>{self.ad()}
+{copy_html}
 <div class="card"><h2>历年{name}日期</h2><table><tr><th>年份</th><th>公历</th><th>星期</th><th>农历</th></tr>{table}</table></div>
 <div class="card"><h2>即将到来的节日</h2><table>{self.upcoming(8)}</table></div>"""
-            self.write(f"/jieri/{slug}/", f"距离{name}还有多少天 - {nd.year}年{name}是几月几号(倒计时)",
-                       f"{nd.year}年{name}是{cn(nd)},星期{WEEK[nd.weekday()]},距今{self.countdown(nd)}。附历年{name}日期表。", body)
-            rows.append((nd, f'<tr><td><a href="/jieri/{slug}/">{name}</a></td><td>{cn(nd)}</td><td>{self.countdown(nd)}</td></tr>'))
+            path = f"/jieri/{slug}/"
+            self.write(path, f"距离{name}还有多少天 - {nd.year}年{name}是几月几号(倒计时)",
+                       f"{nd.year}年{name}是{cn(nd)},星期{WEEK[nd.weekday()]},距今{countdown}。{origin}", body,
+                       crumbs=[("首页", "/"), ("节日倒计时", "/jieri/"), (name, path)],
+                       jsonld=[
+                           self.event_ld(f"{nd.year}年{name}", nd, origin, path),
+                           self.faq_ld([(f"距离{name}还有多少天", countdown), *copy_faq]),
+                       ])
+            rows.append((nd, f'<tr><td><a href="/jieri/{slug}/">{name}</a></td><td>{cn(nd)}</td><td>{countdown}</td></tr>'))
         body = f'<div class="card"><h1>节日倒计时</h1><table><tr><th>节日</th><th>日期</th><th>倒计时</th></tr>{"".join(r for _, r in sorted(rows))}</table></div>'
-        self.write("/jieri/", "节日倒计时 - 距离春节、中秋、国庆等节日还有多少天", "常用传统节日和公历节日倒计时,每天自动更新。", body)
+        self.write("/jieri/", "节日倒计时 - 距离春节、中秋、国庆等节日还有多少天", "常用传统节日和公历节日倒计时,每天自动更新。", body,
+                   crumbs=[("首页", "/"), ("节日倒计时", "/jieri/")])
 
     def jieqi_pages(self):
         rows = []
@@ -321,15 +469,25 @@ class Site:
             table = "".join(f'<tr><td>{d.year}年</td><td><a href="/d/{ymd(d)}/">{d.month}月{d.day}日</a></td><td>星期{WEEK[d.weekday()]}</td></tr>'
                             for d in dates if self.today.year - 1 <= d.year <= self.today.year + 5)
             prev_n, next_n = JIEQI[i - 1], JIEQI[(i + 1) % 24]
+            origin, customs = JIEQI_COPY[slug]
+            date_answer = f"{nd.year}年{name}是{cn(nd)},星期{WEEK[nd.weekday()]},{self.countdown(nd)},为二十四节气第 {i + 1} 个。"
+            copy_html, copy_faq = self.copy_card(name, origin, customs)
+            if slug == "qingming":
+                copy_html = copy_html.replace("</div>", '<p class="muted">祭扫与踏青见<a href="/jieri/qingming/">清明节</a>。</p></div>', 1)
             body = f"""<div class="card"><h1>{name}是几月几号?{nd.year}年{name}时间</h1>
-<div class="big">{cn(nd)}</div><p>{self.countdown(nd)} · 星期{WEEK[nd.weekday()]} · 二十四节气第 {i + 1} 个</p>
+<div class="big">{cn(nd)}</div><p>{date_answer}</p>
 <div class="links"><a href="/jieqi/{JIEQI_SLUG[i - 1]}/">« {prev_n}</a><a href="/jieqi/">全部节气</a><a href="/jieqi/{JIEQI_SLUG[(i + 1) % 24]}/">{next_n} »</a></div></div>{self.ad()}
+{copy_html}
 <div class="card"><h2>历年{name}日期</h2><table><tr><th>年份</th><th>日期</th><th>星期</th></tr>{table}</table></div>"""
-            self.write(f"/jieqi/{slug}/", f"{nd.year}年{name}是几月几号 - {name}时间及倒计时",
-                       f"{nd.year}年{name}是{cn(nd)},星期{WEEK[nd.weekday()]},距今{self.countdown(nd)}。附历年{name}日期。", body)
+            path = f"/jieqi/{slug}/"
+            self.write(path, f"{nd.year}年{name}是几月几号 - {name}时间及倒计时",
+                       f"{date_answer}{origin}", body,
+                       crumbs=[("首页", "/"), ("二十四节气", "/jieqi/"), (name, path)],
+                       jsonld=[self.faq_ld([(f"{name}是几月几号?", date_answer), *copy_faq])])
             rows.append(f'<tr><td><a href="/jieqi/{slug}/">{name}</a></td><td>{cn(nd)}</td><td>{self.countdown(nd)}</td></tr>')
         self.write("/jieqi/", "二十四节气时间表 - 下一个节气是什么、还有几天", "二十四节气日期时间表和倒计时,每天自动更新。",
-                   f'<div class="card"><h1>二十四节气</h1><table><tr><th>节气</th><th>下一次日期</th><th>倒计时</th></tr>{"".join(rows)}</table></div>')
+                   f'<div class="card"><h1>二十四节气</h1><table><tr><th>节气</th><th>下一次日期</th><th>倒计时</th></tr>{"".join(rows)}</table></div>',
+                   crumbs=[("首页", "/"), ("二十四节气", "/jieqi/")])
 
     def shengxiao_pages(self):
         cy = self.today.year
@@ -349,7 +507,8 @@ class Site:
 <p><a href="/shengxiao/{slug}/">查看所有属{animal}的出生年份和年龄 »</a></p></div>
 <div class="card"><div class="links">{"".join(f'<a href="/shengxiao/{x}/">{x}年</a>' for x in range(max(self.cfg["birth_year_from"], y - 5), min(cy, y + 5) + 1) if x != y)}</div></div>"""
             self.write(f"/shengxiao/{y}/", f"{y}年属什么生肖 - {y}年出生今年多大({cy}年)",
-                       f"{y}年是{l.getYearInGanZhi()}年,属{animal},{l.getYearNaYin()}命。{y}年出生的人{cy}年虚岁{age + 1}岁。", body)
+                       f"{y}年是{l.getYearInGanZhi()}年,属{animal},{l.getYearNaYin()}命。{y}年出生的人{cy}年虚岁{age + 1}岁。", body,
+                       crumbs=[("首页", "/"), ("生肖年龄", "/shengxiao/"), (f"{y}年", f"/shengxiao/{y}/")])
         index = []
         for i, (slug, animal) in enumerate(ANIMALS):
             years = [y for y in range(self.cfg["birth_year_from"], cy + 13) if Solar.fromYmd(y, 7, 1).getLunar().getYearShengXiao() == animal]
@@ -360,11 +519,13 @@ class Site:
 <p>属{animal}的出生年份(按春节划分):{"、".join(f"{y}" for y in years if y <= cy)}。下一个{animal}年是 {nxt} 年{"(就是今年)" if nxt == cy else ""}。</p></div>{self.ad()}
 <div class="card"><table><tr><th>出生年份</th><th>干支</th><th>{cy}年年龄</th></tr>{rows}</table></div>"""
             self.write(f"/shengxiao/{slug}/", f"属{animal}的是哪年出生的 - 属{animal}今年多大({cy}年年龄对照表)",
-                       f"属{animal}的出生年份及{cy}年年龄对照表,下一个{animal}年是{nxt}年。", body)
+                       f"属{animal}的出生年份及{cy}年年龄对照表,下一个{animal}年是{nxt}年。", body,
+                       crumbs=[("首页", "/"), ("生肖年龄", "/shengxiao/"), (f"属{animal}", f"/shengxiao/{slug}/")])
             index.append(f'<a href="/shengxiao/{slug}/">属{animal}</a>')
         years = "".join(f'<a href="/shengxiao/{y}/">{y}</a>' for y in range(cy, self.cfg["birth_year_from"] - 1, -1))
         self.write("/shengxiao/", f"十二生肖年份对照表 - 出生年份属什么、今年多大({cy})", "十二生肖年份对照表,查询出生年份对应的生肖和今年年龄。",
-                   f'<div class="card"><h1>十二生肖年龄查询</h1><div class="links">{"".join(index)}</div></div><div class="card"><h2>按出生年份查</h2><div class="links">{years}</div></div>')
+                   f'<div class="card"><h1>十二生肖年龄查询</h1><div class="links">{"".join(index)}</div></div><div class="card"><h2>按出生年份查</h2><div class="links">{years}</div></div>',
+                   crumbs=[("首页", "/"), ("生肖年龄", "/shengxiao/")])
 
     def tools_page(self):
         t = ymd(self.today)
@@ -384,25 +545,38 @@ $('o3').textContent='周岁 '+y+' 岁,已经度过 '+days+' 天'}
 <div class="card"><h2>日期推算(N 天后/前是几号)</h2><div class="form"><label>起始日期<input id="c" type="date" value="{t}"></label>
 <label>天数(负数为之前)<input id="n" type="number" value="100"></label></div><div class="out" id="o2"></div></div>
 <div class="card"><h2>年龄计算</h2><div class="form"><label>出生日期<input id="e" type="date" value="1990-01-01"></label></div><div class="out" id="o3"></div></div>{js}"""
-        self.write("/tools/", "日期计算器 - 两个日期相差多少天、日期推算、年龄计算", "在线日期计算器:计算两个日期相差多少天,推算 N 天后是几号,计算周岁年龄。", body)
+        self.write("/tools/", "日期计算器 - 两个日期相差多少天、日期推算、年龄计算", "在线日期计算器:计算两个日期相差多少天,推算 N 天后是几号,计算周岁年龄。", body,
+                   crumbs=[("首页", "/"), ("日期计算", "/tools/")])
 
     def home(self):
         d, l = self.today, self.days[self.today]
-        nj = l.getNextJieQi()
+        nxt = self.adjacent_jieqi(d)[1]
         special = "、".join(([l.getJieQi()] if l.getJieQi() else []) + self.festivals_of(d))
         years = "".join(f'<a href="/y/{y}/">{y}年</a>' for y in range(self.y0, self.y1 + 1))
+        yi_home, ji_home = l.getDayYi(), l.getDayJi()
+        yi_show = "、".join(yi_home[:8]) + ("等" if len(yi_home) > 8 else "")
+        ji_show = "、".join(ji_home[:8]) + ("等" if len(ji_home) > 8 else "")
+        if nxt:
+            next_jq = f'<b>{esc(nxt[1])}</b>({cn(nxt[0])},{self.countdown(nxt[0])})'
+        else:
+            next_jq = "无"
         body = f"""<div class="card"><h1>今天是{cn(d)} 星期{WEEK[d.weekday()]}</h1>
 <div class="big">农历{l.getMonthInChinese()}月{l.getDayInChinese()}</div>
 <p class="muted">{l.getYearInGanZhi()}年({l.getYearShengXiao()}年) {l.getMonthInGanZhi()}月 {l.getDayInGanZhi()}日{(' · <span class="red">' + esc(special) + '</span>') if special else ''}</p>
-<p><b>宜:</b>{esc("、".join(l.getDayYi()[:8]))}<br><b>忌:</b>{esc("、".join(l.getDayJi()[:8]))}</p>
-<p>下一个节气:<b>{nj.getName()}</b>({cn(to_date(nj.getSolar()))},{self.countdown(to_date(nj.getSolar()))}) · <a href="/d/{ymd(d)}/">今日详细黄历 »</a></p></div>{self.ad()}
+<p><b>宜:</b>{esc(yi_show or "无")}<br><b>忌:</b>{esc(ji_show or "无")}</p>
+<p>下一个节气:{next_jq} · <a href="/d/{ymd(d)}/">今日详细黄历 »</a></p></div>{self.ad()}
 <div class="card"><h2>{d.year}年{d.month}月</h2>{self.month_grid(d.year, d.month)}</div>
 <div class="card"><h2>即将到来的节日</h2><table>{self.upcoming(8)}</table><p><a href="/jieri/">全部节日倒计时 »</a></p></div>
 <div class="card"><h2>年历</h2><div class="links">{years}</div></div>"""
+        desc = f"今天是{cn(d)},星期{WEEK[d.weekday()]},农历{l.getMonthInChinese()}月{l.getDayInChinese()},{l.getYearInGanZhi()}年。万年历查询农历、节气、节日倒计时和黄历宜忌。"
         self.write("/", f"今天农历几月几号 - {cn(d)}农历{l.getMonthInChinese()}月{l.getDayInChinese()} 万年历黄历",
-                   f"今天是{cn(d)},星期{WEEK[d.weekday()]},农历{l.getMonthInChinese()}月{l.getDayInChinese()},{l.getYearInGanZhi()}年。万年历查询农历、节气、节日倒计时和黄历宜忌。", body)
+                   desc, body, jsonld=self.home_ld(desc))
 
     def build(self):
+        missing_f = [s for s, *_ in FESTIVALS if s not in FESTIVAL_COPY]
+        missing_j = [s for s in JIEQI_SLUG if s not in JIEQI_COPY]
+        if missing_f or missing_j:
+            raise SystemExit(f"文案缺少节日{missing_f} 节气{missing_j}")
         if OUT.exists():
             shutil.rmtree(OUT)
         OUT.mkdir()
